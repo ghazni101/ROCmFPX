@@ -1,0 +1,20 @@
+# Magpie compare: ROCmI4 W4A4 MMQ epilogue restructure on gfx1100.
+# baseline-pre-p2 = commit 15acbdbbf tree; p2-epilogue = HEAD tree.
+# Both harnesses compile the real kernel headers from their respective tree
+# and gate on bit-exact outputs against the shared golden checksum.
+kernels:
+  - id: baseline-pre-p2
+    type: hip
+    source_files:
+      - /repo-head/ggml/rocmfpx/magpie-eval/baseline/kernel.hip
+    working_dir: /repo-head/ggml/rocmfpx/magpie-eval/baseline
+    compile_command: "hipcc -O3 -Wno-unused-result --offload-arch=gfx1100 -DGGML_USE_HIP -DGGML_ROCMI4_W4A4=1 -I/repo-base/ggml/src -I/repo-base/ggml/src/ggml-cuda -I/repo-base/ggml/include kernel.hip -o kernel"
+    testcase_command: "./run_test.sh"
+
+  - id: p2-epilogue
+    type: hip
+    source_files:
+      - /repo-head/ggml/rocmfpx/magpie-eval/optimized/kernel.hip
+    working_dir: /repo-head/ggml/rocmfpx/magpie-eval/optimized
+    compile_command: "hipcc -O3 -Wno-unused-result --offload-arch=gfx1100 -DGGML_USE_HIP -DGGML_ROCMI4_W4A4=1 -I/repo-head/ggml/src -I/repo-head/ggml/src/ggml-cuda -I/repo-head/ggml/include kernel.hip -o kernel"
+    testcase_command: "./run_test.sh"
