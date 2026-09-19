@@ -1240,11 +1240,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 
 #if GGML_ROCMI4_W4A4
-// Native packed IU4/W4A4 dot product for gfx1151.
+// Native packed IU4/W4A4 dot product for RDNA3 (gfx110x / gfx115x).
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmi4_w4a4_wmma(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
-#if defined(AMD_WMMA_AVAILABLE) && defined(__gfx1151__)
+#if GGML_HIP_WMMA_IU4_AVAILABLE
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;  // 4 packed dwords == 32 nibbles == K=32
     typedef tile<16,  4, int, input_layout>        tile_B;
