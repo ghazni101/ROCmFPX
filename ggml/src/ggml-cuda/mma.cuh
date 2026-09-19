@@ -826,6 +826,30 @@ namespace ggml_cuda_mma {
 #endif // TURING_MMA_AVAILABLE
     }
 
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    // RDNA3 16-byte LDS operand load for tile<16,4,T,I_MAJOR_MIRRORED>.
+    //
+    // On RDNA3 the generic loader above emits two 8-byte copies per operand, so
+    // one mma_iu4 pays four 8-byte LDS loads. Those two copies read contiguous
+    // source bytes (get_i(0) is threadIdx.x % 16 and does not depend on l), so a
+    // single 16-byte copy is exactly equivalent and roughly halves the LDS
+    // operand instruction count. Measured on the standalone probes this raises
+    // the operand-path ceiling from ~170 to ~240 TOPS.
+    //
+    // REQUIRES (xs0 + t.get_i(0)*stride) to be 16 B aligned. That holds for the
+    // ROCmI4 SRAM layout (stride 44, kp a multiple of 4) but NOT for every
+    // layout: Q6_K uses stride 79, so odd rows would load misaligned. Only call
+    // this from dots whose layout has been checked, and keep the generic loader
+    // as the default.
+    template <typename T, data_layout dl>
+    static __device__ __forceinline__ void load_ldmatrix_16(
+            tile<16, 4, T, dl> & t, const T * __restrict__ xs0, const int stride) {
+        static_assert(dl == DATA_LAYOUT_I_MAJOR_MIRRORED, "bad data layout");
+        static_assert(sizeof(t.x) == 16, "bad ne");
+        ggml_cuda_memcpy_1<16>(t.x, xs0 + t.get_i(0)*stride);
+    }
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+
     template <typename T, data_layout dl>
     static __device__ __forceinline__ void load_ldmatrix(
             tile<16, 8, T, dl> & t, const T * __restrict__ xs0, const int stride) {
