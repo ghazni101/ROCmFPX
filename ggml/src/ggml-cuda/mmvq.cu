@@ -55,6 +55,17 @@
 #error "GGML_ROCMFP4_MOE_MMVQ_ROWS_PER_BLOCK must be between 1 and 4"
 #endif
 
+// Discrete RDNA3 (gfx110x) MMVQ occupancy for Q4_0_ROCMI4. Stock Q4_0 uses 8
+// warps at ncols=1; ROCmI4 previously fell through to 1. 1/2/4/8 are legal.
+#ifndef GGML_ROCMI4_RDNA3_NWARPS
+#define GGML_ROCMI4_RDNA3_NWARPS 1
+#endif
+
+#if GGML_ROCMI4_RDNA3_NWARPS != 1 && GGML_ROCMI4_RDNA3_NWARPS != 2 && \
+    GGML_ROCMI4_RDNA3_NWARPS != 4 && GGML_ROCMI4_RDNA3_NWARPS != 8
+#error "GGML_ROCMI4_RDNA3_NWARPS must be one of: 1, 2, 4, 8"
+#endif
+
 #ifndef GGML_ROCMFPX_RDNA35_NWARPS
 #define GGML_ROCMFPX_RDNA35_NWARPS 1
 #endif
@@ -696,6 +707,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 2;
                 case GGML_TYPE_IQ4_NL:
                     return 8;
+                case GGML_TYPE_Q4_0_ROCMI4:
+                    return GGML_ROCMI4_RDNA3_NWARPS;
                 default:
                     return 1;
             }
