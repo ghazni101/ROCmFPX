@@ -7,6 +7,17 @@ Model: `/home/ghazni/models/rocmfpx/cafonez/Qwen3.8-27B-ROCmI4/Qwen3.8-27B-Q4_0_
 Status: partially executed. Six work packages measured, one landed. Every
 number below was measured on this host, not extrapolated from vendor peaks.
 
+**Revised 2026-09-19** (Revision 2, executed same day). Four packages ran end
+to end with the gates below: P-1 refuted the bank-conflict theory and killed
+P-3 before any layout code was written; P-2 landed at **+7.2% pp2048**
+(1434.20 -> 1537.27 +/- 0.40, token-exact); P-1c partitioned the remaining
+kernel into 343/190/137 us; P-8 (k-loop double buffering, built to recover the
+staging bucket) measured -11.4% and was reverted with the residency mechanism
+identified. P-4 was refuted by byte arithmetic without being built. Current
+state of the branch: pp2048 1535-1537, tg128 42.0-42.5, tree contains only the
+P-2 kernel change plus this document and the new probe. Remaining open:
+P-6 (+8% pp, its own project), P-7 (+2-3% pp), P-5 (+3-6% tg).
+
 **Outcome so far**
 
 | area | result |
@@ -23,7 +34,9 @@ The honest summary for this model on this GPU: prefill had one real, modest
 win; decode was already within ~10% of its floor. Getting materially more
 decode throughput on a 27B dense-ish model at 4.25 bits requires reading fewer
 bytes per token, which is exactly what speculative decoding does and what the
-constraints exclude.
+constraints exclude. Revision 2 keeps that decode conclusion and adds one
+quantified prefill mechanism that the probes could not see because the probes
+never paid the conflict (see Operand path, amended below).
 
 ## Goal
 
@@ -128,6 +141,28 @@ Sweeping 1, 2, 4 and 8 independent accumulator chains gives 154.7 -> 180.0 TOPS
 blocks from 192 to 3072 is likewise flat. The operand **load width** dominates
 both.
 
+### Revision 2 amendment: the ~240 TOPS figure is conflict-free by construction - DERIVATION SUPERSEDED BY MEASUREMENT
+
+`wmmalds2` gives each lane the next consecutive 16-byte chunk. The real kernel
+reads row-major at `sram_stride = 44` (x) and `MMQ_TILE_Y_K = 36` (y) dwords,
+one 16-byte read per row, 16 rows per wave ([mmq-vec-dot.cuh:1279, 1286]).
+Any stride keeping the 16-byte loads legal is a multiple of 4 dwords, so the
+16 rows cover at most 8 of the 32 LDS banks - a structural 2-way conflict for
+any legal stride, any row permutation, any legal pad. That derivation is
+arithmetically correct and **performance-irrelevant**: wmmalds4 measured the
+strided pattern at 227-236 TOPS, equal to the conflict-free control. A 2-way
+conflict signature evidently does not slow `ds_read_b128` on gfx1100 the way
+dword-grained models predict, and at the probe's ~920 GB/s the LDS has
+headroom to absorb it. The derivation is kept for the record; the conclusion
+it pointed at (P-3, k-major staging) was derived, then killed by P-1 before
+any layout code was written. Read the
+wmmalds4 table in P-1 for the measured state.
+
+What survives from this line of inquiry: the operand-path question is closed
+by measurement - 2x16-byte reads are already the right width, and no pad,
+permutation or staging transpose buys anything. The kernel's 592 us
+epilogue-free floor is NOT operand-load-pattern cost. P-1c attributes it.
+
 ## Model geometry (drives all the arithmetic)
 
 Parsed from the GGUF:
@@ -221,6 +256,27 @@ Against the ideal MMA-issue time for this shape (60.13 GFLOP / 282 TOPS =
 not the scale application.** Both are implemented in the same non-unrolled
 `k01` loop, so the 592 us floor is most likely exposed latency rather than
 issue throughput. See PP-1 for the redirected work.
+
+### Revision 2 amendment: the scale gathers are redundant by J/16
+
+The ablation decomposition stands, but one of its costs is not mandatory. In
+`ggml_cuda_mmq_vec_dot_rocmi4_w4a4_wmma` ([mmq-vec-dot.cuh:1298]) the gather
+`dA = x_df[i*sram_stride + k0/QI8_0]` sits inside the `j0` loop, while `i`
+depends only on `l` and the warp row - never on `j0`. Runtime `J_best` picks
+J=128 for this model (the heuristic at [mmq.cuh] minimizes j-tiles), so the
+`j0` loop runs `J/(ntx*tile_C::J) = 8` times and re-gathers the same 8 `dA`
+values 8 times per k-step. The measured 122.7 us gather share is dominated by
+loads the compiler cannot legally hoist across the shared-memory barrier
+structure of the enclosing loop (tile_x is re-staged every iteration; the
+gather addresses are loop-invariant but the compiler does not know x_df
+contents are unchanged, and more importantly the loads sit under `#pragma
+unroll` j0/n loops whose live ranges then multiply).
+
+Hoisting `dA` (8 floats, +8 VGPRs) above the `j0` loop removes 7/8 of the
+gather traffic. Folding the `*16` into it is exact in fp32: `16*dA` is a
+power-of-two exponent shift, and `float(C*16)*dA == float(C)*(16*dA)` because
+both round the same real product of integers times fp32 constants. This is
+work package P-2 and it is gated by Tier 2 token-exactness, not Tier 3.
 
 The ablation was a disposable local build of `mmq-vec-dot.cuh`; the source was
 restored byte-identical afterwards and the restored build re-measured to
@@ -384,19 +440,20 @@ The change is scoped to the W4A4 ROCMI4 dot only. Extending it to the other
 quant types is possible but must be per-layout: `Q6_K`'s `sram_stride` is 79,
 which is not a multiple of 4, so odd rows would load misaligned there.
 
-Remaining in PP-1:
+Remaining in PP-1 - superseded by Revision 2 packages P-1/P-2/P-8, which
+replace items 2-4 with mechanisms that name a cause:
 
-2. **Explain the residual.** Epilogue-free the kernel runs at 101.55 TFLOPS
-   against ~170 for its own load pattern, and the widening moved it less than
-   expected. Re-derive where the time actually goes against the new baseline
-   rather than trusting the probe model again.
-3. **Bank conflicts and SRAM strides.** The `dA`/`dB` gathers in the epilogue
-   and the `sram_stride` walk are the remaining untested suspects. A stride
-   sweep (pad by 1-2 dwords) is cheap and would show up immediately as a
-   conflict signature.
-4. **The epilogue itself (secondary).** Folding the `*16` into a precomputed
-   scale removes the measured 48.4 us arithmetic chain; vectorising the `dA`
-   gather attacks part of the 122.7 us. Capped at 22.4% of the kernel.
+2. ~~**Explain the residual.**~~ Explained by P-1c: 343 us MMA+epilogue,
+   190 us staging+barriers (already partly hidden by co-residency), 137 us
+   operand loads. The conflict explanation once proposed here was killed by
+   P-1.
+3. ~~**Bank conflicts and SRAM strides.**~~ Resolved by derivation, then
+   measured: every legal row-major stride conflicts at least 2-way on paper,
+   and wmmalds4 shows that costs nothing for `ds_read_b128` on gfx1100. No
+   pad, no layout change warranted.
+4. ~~**The epilogue itself (secondary).**~~ Landed as P-2 (+7.2% pp2048,
+   token-exact). The real redundancy was 2x on the gathers (the j0 loop
+   re-reads them once), not 7/8 as first estimated here - corrected in P-2.
 
 Refuted by measurement - do not retry without new evidence:
 
@@ -532,21 +589,12 @@ Do not reopen this without a new mechanism. The `GGML_ROCMI4_RDNA3_NWARPS` and
 `GGML_ROCMI4_Q8_1_MMVQ_VDR` knobs were already swept on this branch (nwarps 4
 ties, 8 regresses, VDR 4 is numerically illegal).
 
-### TG-2 - Cut the 1414 small kernels per token
+### TG-2 - Cut the 1414 small kernels per token (superseded by P-4 + P-5)
 
 At ~2.7 us of dispatch floor each, this stream costs ~3.8 ms/token of dispatch
-alone against 2.75 ms of execution.
-
-- Fuse `quantize_q8_1` into the MMVQ kernel, or at minimum avoid re-quantizing
-  the same activation: 436 quantize launches for 436 matvecs suggests no reuse
-  today. Verify whether `ffn_gate`/`ffn_up`, which share an input, quantize it
-  twice.
-- Fuse the SSM-layer elementwise chain: `l2_norm_f32`, `k_bin_bcast`,
-  `unary_gated_op`, `cpy_scalar`, `ssm_conv_f32` together account for ~390
-  launches/token.
-
-Acceptance: dispatches/token falls measurably (re-run the rocprofv3 kernel
-trace and compare counts); `llama-bench -n 128 -r 5` improves.
+alone against 2.75 ms of execution. Revision 2 splits this into P-4 (act
+quantization into MMVQ) and P-5 (GDN elementwise fusion), each with its own
+gate; the sizing above (+5% to +8%) is replaced by the per-package estimates.
 
 ### TG-3 - KV cache quantization (REFUTED, do not ship)
 
@@ -589,6 +637,192 @@ graphs ON measures +/-207.89 against +/-19.92 with graphs OFF. That is a
 stability issue for short prompts worth tracking separately. It is not a
 throughput lever, and graphs must not be disabled to chase it - doing so costs
 4.6% on decode to buy an unstable short-prompt prefill number.
+
+## Revision 2 work packages (2026-09-19)
+
+Ordered by (confidence x payoff) / cost. P-1 is a kill test and comes first by
+construction. Every package states its own acceptance; nothing merges on a
+probe number alone (the PP-1 lesson).
+
+### P-1 - Confirm the LDS conflict theory before any kernel work (hours) - EXECUTED, THEORY REFUTED
+
+Two checks were run on 2026-09-19:
+
+1. **Probe extension (`ggml/rocmfpx/probes/wmmalds4.hip`): REFUTED.** The
+   kernel's actual pattern - one 16-byte read per operand per `mma_iu4`, row =
+   lane % 16, row-major stride 44/36 dwords - measures **227-236 TOPS** across
+   chains 1-4 and 192-3072 blocks, against the consecutive-chunk control at
+   211-246 TOPS in the same binary. Identical within noise. The predicted
+   drop to ~120-140 TOPS did not happen.
+2. **rocprofv3 counters: superseded** - no point counting conflicts on a
+   pattern the probe already shows to be conflict-free-equivalent.
+
+Post-mortem, so nobody re-derives the wrong theory a third time: at 236 TOPS
+the probe streams 32 B per `mma_iu4` = ~920 GB/s, about 26% of per-CU LDS
+capacity, so neither pattern is LDS-bound and a 2-way conflict penalty cannot
+surface. The earlier per-CU demand arithmetic that put the kernel near LDS
+saturation was wrong (it mixed GPU-wide TOPS with per-CU bytes). What the
+probe family actually shows, combining wmmalds2/wmmalds3/wmmalds4:
+
+| reads per mma_iu4 | bytes | best TOPS | effective LDS GB/s |
+|---|---|---:|---:|
+| 4 x 8 B (wmmalds3) | 32 B | 152-170 | ~640 |
+| 2 x 16 B, consecutive (wmmalds2) | 32 B | 230-246 | ~950 |
+| 2 x 16 B, row-major 44/36 (wmmalds4) | 32 B | 227-236 | ~920 |
+
+Same bytes, 1.5x rate: the cost driver is **LDS instruction count / width**,
+not bank conflicts. That is consistent with the +3% the 16-byte widening
+bought in the real kernel and closes the operand-path question: there is no
+large operand-load lever left.
+
+**P-3 (k-major staging) is killed by its own kill criterion. Do not build it.**
+
+P-1b is repurposed: attribute the real kernel's 592 us epilogue-free floor
+directly, with an ablation that separates staging from compute inside the k
+loop, plus rocprofv3 counters on the surviving variant. See P-1c.
+
+### P-1c - Attribute the residual floor: staging vs compute - EXECUTED 2026-09-19
+
+Ablation of the current (P-2) kernel on the perf shape, baseline 670.47 us,
+same discipline as PP-0 (diagnostic wrong builds, restored after):
+
+- V1: `vec_dot` keeps every operand LDS load (A rows, B rows, dA gathers,
+  dB), loads kept alive by a checksum; no MMA, no epilogue: **327.52 us**
+- V2: `vec_dot` body empty; staging + barriers + y copies only: **190.49 us**
+
+| bucket | us | share |
+|---|---:|---:|
+| MMA issue + fp32 epilogue | 343.0 | 51% |
+| staging + barriers + loop | 190.5 | 28% |
+| operand LDS loads inside vec_dot | 137.0 | 20% |
+
+The 343 us bucket sits ~1.4x above the ~250 us realistic MMA-issue floor, so
+the epilogue's VALU work still competes with WMMA issue (ISA 7.9), but its
+per-element cost is near-minimal: cvt + 2 mul + add per output element per
+k-step, and the scales differ every 32-element block, so pre-accumulating in
+integer across blocks is not legal. The 327 us of staging+loads motivated
+P-8 (in-kernel pipelining), which measured the model incomplete - see P-8.
+
+rocprofv3 kernel trace on the same shape (P-2 build): `mul_mat_q<q4_0_rocmi4,
+128, false>` 607.98 us average over 1479 dispatches (profiler durations
+exclude inter-kernel gaps; consistent with the 670 us event timing), VGPR 224
+(confirming P-2 caused no spills). `quantize_mmq_q8_1` runs 26.29 us per
+launch and 38.9 ms of the pass = 4.1% - that is P-7's measured anchor.
+
+### P-2 - Epilogue: hoist `dA`, fold `*16` - EXECUTED 2026-09-19, LANDED
+
+**Correction to the sizing below, made during implementation.** For the
+J_MAJOR C tile on RDNA3, `tile_C::get_i(l) = 2*l + tid/16`: each lane's 8
+accumulator elements sit in 8 different rows, so `dA` is per (n, l) - 32
+distinct values per lane per k-step, and the `j0` loop only re-reads them 2x,
+not 8x. The honest expectation was therefore "about half the gather cost plus
+the removed `*16` integer multiply", ~10% of the kernel, not the 7/8-gather
+figure first written here.
+
+Implemented: `dA16[ntx][tile_C::ne]` loaded above the `j0` loop, `*16` folded
+into it, and the epilogue keeps the original multiply association -
+`(float(C.x[l]) * dA16[n][l]) * dB` - because folding the constant into `dB`
+instead would change the fp32 rounding order and break Tier 2. First version
+had exactly that bug and was fixed before building.
+
+| measurement | before | after |
+|---|---:|---:|
+| `pp2048` (fresh baseline same day) | 1434.20 +/- 2.85 | **1537.27 +/- 0.40 (+7.2%)** |
+| `tg128` | 42.11 +/- 0.15 | 42.40 +/- 0.16 (noise; MMVQ untouched) |
+| perf shape m=4096 n=512 k=14336 | 727.61-739.31 us | **670.47 us / 89.68 TFLOPS** |
+| VGPR count (rocprofv3) | 224 | 224 (no spill from the +32 registers) |
+| Tier 1: MUL_MAT / MUL_MAT_ID / IU4 oracle | OK | 12/12 / OK / OK |
+| Tier 2 greedy decode | reference | token-exact |
+
+Realised gain +7.2% `pp2048`, inside the corrected +7-9% window. Landed in
+`ggml/src/ggml-cuda/mmq-vec-dot.cuh` on this branch.
+
+### P-3 - k-major SRAM staging - KILLED BY P-1, DO NOT BUILD
+
+Written before P-1 ran; kept so the reasoning and the kill are on record.
+The mechanism (structural 2-way conflict) was derived correctly from the bank
+model and measured to be irrelevant for `ds_read_b128` on gfx1100 (P-1a:
+227-236 TOPS strided vs 211-246 consecutive). No k-major transposition of the
+x or y staging tiles is warranted. The `load_ldmatrix_16` alignment and
+`test-backend-ops` notes below remain valid for any future staging change.
+
+- ~~Gate: Tier 1 at unchanged limits, Tier 2 token-exact, the IU4 oracle,
+  `test-backend-ops` across all shapes and J values.~~
+- ~~Sizing: kernel +30-60% -> pp2048 +25-45%.~~ Withdrawn.
+
+### P-8 - Double-buffered k loop - EXECUTED 2026-09-19, REFUTED, REVERTED
+
+Implemented behind a `double_buffer` field in `ggml_cuda_mmq_config` (default
+false, set only for the W4A4 ROCMI4 config): two x tile sets and two y tile
+sets in an `ids | y0 | y1 | x0 | x1` layout, y group g+1 staged during
+vec_dot 1, the next x tile and y group g+2 staged during vec_dot 2, two
+barriers per k-step instead of four. Same accumulation order, so numerics are
+exact.
+
+The gates earned their keep twice during bring-up:
+
+1. First build failed Tier 1 on every MMQ shape (ERR 0.92 at m=1 n=64
+   k=256): the loop staged only one y group per iteration, so vec_dot 1 of
+   every iteration after the first read a stale group. `QK8_1_MMQ = 128`, so
+   one iteration consumes two y groups. Fixed with a fixed-parity y schedule
+   (even groups in y0, odd in y1, x swapped alone).
+2. Second build still failed that shape (ERR 0.53): the kernel preamble
+   places `tile_x` directly after the single y tile, so an naively placed
+   `tile_y2` aliased the x tile. Fixed with the explicit five-region layout.
+
+Final build: Tier 1 green (12/12, MUL_MAT_ID OK, oracle OK), Tier 2
+token-exact, and **pp2048 = 1361.25 +/- 1.32 against 1537.27 for P-2: an
+11.4% regression. Reverted; reverted state re-verified at 1535.03 +/- 1.84
+with Tier 1 green.**
+
+Why it lost, for the record: the P-1c staging+barriers bucket is not simply
+serialized time waiting to be pipelined. The single-buffered J=128 tile set
+is 30.2 KB of LDS, which allows two workgroups per CU, and a co-resident
+workgroup already covers barrier drains. PP-2's occupancy sweep could not see
+this because it varied the occupancy target at unchanged LDS. Doubling the
+tiles to ~60 KB forces one workgroup per CU and surrenders that overlap; the
+intra-workgroup pipeline does not win it back.
+
+Do not re-attempt k-loop double buffering for this config without first
+shrinking a tile set below ~16 KB, which the 4.25-bit format does not allow.
+Recorded as a trap: an ablation bucket measured on a 2-workgroup kernel is
+not recoverable by a change that costs residency.
+
+### P-4 - Fuse activation quantization into MMVQ - REFUTED BY BYTE ARITHMETIC, DO NOT BUILD
+
+Fusing the quantizer into `mul_mat_vec_q` makes every MMVQ block re-read the
+f32 activation row (20 KB at K=5120) instead of the q8_1 row (5.5 KB). At
+roughly 80-270 blocks per matvec that adds on the order of 1 GB of L2 traffic
+per token to save about 1.2 ms of dispatch floor (436 launches x ~2.7 us).
+The added bytes cost more than the dispatch saves. The standalone
+`quantize_q8_1` kernel (0.51 ms exec per token) stays.
+
+### P-5 - Fuse the GDN elementwise chain (open, scoped, not started)
+
+~390 of 1414 dispatches per token (`l2_norm_f32`, `k_bin_bcast`,
+`cpy_scalar`, `unary_gated_op`, `ssm_conv_f32`), estimated +3-6% tg. Needs
+new fused kernels plus graph plumbing. The P-8 residency lesson applies: any
+fusion whose LDS footprint crosses half of 64 KiB per workgroup can lose more
+than it saves - keep fused tiles small and re-measure dispatches per token
+alongside tg (Tier 2 for pure reorderings, Tier 3 with pre-declared tolerance
+for accumulation-order changes).
+
+### P-6 - Chunked GDN prefill (unchanged from PP-3: 1-2 weeks, +8% pp)
+
+The PP-3 assessment stands: a real kernel project (WY/triangular-solve
+structure, fluent-but-wrong failure mode). Its prefill share grows now that
+P-2 landed. Keep the PP-3 acceptance in full, including the Tier 3 (not
+Tier 2) gate and the rollback switch. Not started in this revision.
+
+### P-7 - Prefill elementwise cleanup (open, measured anchor)
+
+`quantize_mmq_q8_1` costs 26.29 us per launch and 4.1% of the perf-shape pass
+(rocprofv3, P-1c). Sharing one quantized buffer between `ffn_gate`/`ffn_up`
+and between the q/k/v projections (which share their input norm) would remove
+on the order of half the launches. Requires cross-op plumbing in the CUDA
+backend of the kind that already exists for the MMVQ GLU fusion. Estimated
+ceiling +2-3% pp. `concat_non_cont` (96 x 85 us per pp512 pass) may be
+removable at the graph level - investigate, do not force it. Gate: Tier 2.
 
 ## Correctness plan
 
@@ -669,6 +903,17 @@ plan.
   +3% end to end, because operand loads are a much smaller share of the real
   kernel than of a four-line probe loop. Use probes to decide *direction* and
   to rule things out; never to size a delivery.
+- **An ablation bucket measured on an N-workgroup kernel is not recoverable by
+  a change that costs residency.** P-1c put 190 us on staging+barriers, but
+  that bucket was partly hidden by a second co-resident workgroup (30.2 KB LDS
+  per workgroup, two fit per CU). P-8's doubled tiles forced one workgroup per
+  CU and the "recovered" bucket came back as an 11.4% regression. Check what
+  the LDS footprint does to workgroups per CU before crediting a bucket as
+  headroom.
+- **Decode-side byte trades must be counted in both currencies.** P-4 looked
+  like +5-7% from dispatch counts alone; counting the extra f32 re-read bytes
+  (~1 GB/token) shows it is net negative. Dispatch savings and byte costs are
+  the same budget on a bandwidth-bound GPU.
 - **A model that fits the baseline is not validated for a change.** The
   `bytes / 792 GB/s + 6.35 ms` decode model predicted f16 depth scaling to
   within 1% and was then used to project KV quantization at +12% to +20%. KV
@@ -693,7 +938,10 @@ plan.
 
 | Risk | Mitigation |
 |---|---|
-| 16-byte LDS operand load is illegal for some `sram_stride`/`k00` combinations | Derive alignment from the actual config values first; keep a guarded 2x8-byte path for the unaligned case; `test-backend-ops` across all shapes and J values, not one shape |
+| Probe models disagree with the real kernel (happened twice: PP-1, P-1) | Decide direction with probes, size only with real-kernel ablations and rocprofv3; kill tests before builds |
+| P-1c ablation variants are numerically wrong | They are diagnostic only, like PP-0; md5-verified restore + rebuilt baseline re-measure after each |
+| P-2 hoist raises VGPR pressure and spills | Check the compiler's SGPR/VGPR usage; fall back to hoist-without-fold; keep only what wins `pp2048` |
+| P-2 fold claimed bit-exact but tokens diverge | Then the exactness argument is wrong somewhere - stop, do not loosen Tier 2 to a tolerance |
 | PP-0 shows the epilogue is not the bottleneck | Already happened; plan redirected to operand staging, and the operand probes then narrowed it to load width |
 | Epilogue trimming is numerically sensitive | `*16` folding is exact in fp32 for these magnitudes; verify with Tier 1 + Tier 2, do not assume |
 | Chunked GDN diverges from the sequential reference | Declare tolerance from accumulation-order analysis first; A/B on random inputs across lengths before touching the model |
@@ -725,6 +973,17 @@ plan.
   WMMA. MMVQ is the right place for DOT8, and it is already there.
 - **Int8 exact path for prefill.** 1090.75 t/s vs 1380.09. W4A4 wins; the
   question is only whether its accuracy cost is acceptable per Tier 3.
+- **Weight-stationary persistent MMQ** (stage each weight tile once instead of
+  once per j-block). Total LDS write volume is 14.3 GB x (J=128/16 lanes) ~ 16
+  re-reads = ~229 GB per pp2048 pass, ~7.6 ms against ~30 TB/s of aggregate
+  LDS write bandwidth - under 1% of the pass. Not worth the invasive rewrite.
+- **VOPD dual issue (ISA 7.6) for the epilogue.** VOPD accepts VOP2-class
+  opcodes only; WMMA is VOP3P and cannot dual-issue. The epilogue's VALU work
+  competes with WMMA for issue (ISA 7.9: WMMA internally uses the DOT
+  instructions), which is a reason P-2 helps, not a dual-issue opportunity.
+- **SLC/DLC streaming cache hints (ISA 4.1.1) on MMVQ weight loads.** MMVQ
+  already streams at 94% of what the on-disk layout permits; the bound on this
+  is ~4% and probably less. Revisit only if P-4/P-5 land and a gap remains.
 
 ## Suggested order
 
@@ -738,20 +997,44 @@ Completed and measured:
 6. ~~TG-3 KV quantization~~ - refuted, costs 5% to 10%
 7. ~~PP-2 tile sweep~~ - no change; shipped config was already best
 
-Still open:
+Revision 2 final state (all short items executed 2026-09-19):
 
-8. **PP-3** chunked GDN prefill - sized at **~+8% pp**, measured linear-in-token
-   scaling confirms the serial scan is the cause, and there is no GPU
-   implementation to port. This is its own kernel project with its own
-   validation cycle (see the section above); it needs a focused pass, not a
-   tail-end of this one.
-9. **PP-1 items 2-3** - residual attribution against the new baseline.
-   The bank-conflict stride sweep is likely a dead end: any stride satisfying
-   the required `% 4` alignment conflicts 2-way across 16 rows, so it is
-   structural rather than tunable.
-10. **TG-2** dispatch reduction - +5% to +8% at best, needs core dispatch
-    changes; poor value against the regression risk.
-11. **PP-4** elementwise cleanup - small.
+1. ~~**P-1** conflict confirmation~~ - EXECUTED, theory refuted, P-3 killed.
+   Probe kept as `ggml/rocmfpx/probes/wmmalds4.hip`.
+2. ~~**P-2** epilogue hoist + `*16` fold~~ - **LANDED, +7.2% pp2048**
+   (1434.20 -> 1537.27), Tier 1 + Tier 2 green.
+3. ~~**P-1c** staging-vs-compute partition~~ - EXECUTED: 343/190/137 us split
+   (MMA+epilogue / staging+barriers / operand loads).
+4. ~~**P-8** double-buffered k loop~~ - EXECUTED, -11.4% pp2048, reverted.
+   The staging bucket is already hidden by 2-workgroup co-residency.
+5. ~~**P-4** quantize-into-MMVQ fusion~~ - refuted by byte arithmetic before
+   implementation.
+6. **P-7** prefill cleanup - open, +2-3% pp ceiling, measured anchor.
+7. **P-5** GDN elementwise fusion - open, +3-6% tg, invasive.
+8. **P-6** chunked GDN - open, +8% pp, its own focused project.
+
+### Revision 2 outcome
+
+| step | result |
+|---|---|
+| P-2 epilogue hoist | **+7.2% pp2048, landed** (1434.20 -> 1537.27 +/- 0.40) |
+| P-1 conflict theory | refuted by probe; staging-transpose lever closed |
+| P-1c floor partition | 343 us MMA+epilogue / 190 us staging / 137 us loads |
+| P-8 k-loop pipelining | refuted by measurement (-11.4%); residency mechanism recorded |
+| P-4 quantize fusion | refuted by arithmetic; dispatch cost < re-read bytes |
+| decode | unchanged from Revision 1: 42 t/s is within ~10% of the format+GPU floor |
+
+Where this leaves the model on this GPU: **pp2048 1537 t/s (+7.4% over the
+branch baseline), tg128 42.0-42.5 t/s.** The remaining prefill levers are
+P-6 (+8%, a project), P-7 (+2-3%) and P-5 (+3-6% tg); the remaining decode
+floor is the DRAM read of 13.62 GB per token, which is untouchable without
+speculative decoding (excluded) or a different format (excluded).
+
+Decode keeps its Revision 1 conclusion: 42.5 t/s is within ~10% of what this
+model, the 17-byte block format and this GPU permit without speculative
+decoding. The work above targets ~45-48 t/s; the 67.8 t/s DRAM floor needs
+fewer bytes per token, which without speculative decoding means changing the
+GGUF - a non-goal.
 
 ## References
 
