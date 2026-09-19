@@ -80,7 +80,8 @@ cmake --build "$BUILD_DIR" -j "$JOBS" --target \
     llama-bench \
     test-backend-ops \
     test-quantize-fns \
-    test-quantize-perf
+    test-quantize-perf \
+    test-rocmi4-iu4-dot
 
 rocmfpx_verify_hip_arch "$BUILD_DIR" "$HIP_ARCH"
 

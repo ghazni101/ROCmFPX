@@ -610,15 +610,22 @@ static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_rocmi4 * bq4 = (const block_rocmi4 *) vbq + kbx;
-    const int * q8 = (const int *) bq8_1->qs + iqs;
+    const int * yqs = (const int *) bq8_1->qs + iqs;
 
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_ROCMI4_Q8_1_MMVQ; ++l) {
         const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+#if defined(GGML_ROCMI4_W4A4) && GGML_ROCMI4_W4A4
+        // Activations are packed IU4 in the same Q4_0 nibble layout as the
+        // weights (lo = elem j, hi = elem j+16). V_DOT8_I32_IU4 is the true
+        // integer 8-nibble product; unlike WMMA IU4 there is no *16 scale.
+        sumi = ggml_cuda_dot8_iu4(aux_q4, yqs[l], sumi);
+#else
         const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+        sumi = ggml_cuda_dp4a(v.x, yqs[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, yqs[l + 4], sumi);
+#endif
     }
 
     return __low2float(bq8_1->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;

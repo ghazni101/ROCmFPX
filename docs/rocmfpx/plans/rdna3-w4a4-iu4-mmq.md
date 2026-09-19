@@ -244,3 +244,38 @@ Landed and validated on `feature/rdna3-w4a4-iu4-mmq`:
 
 Next optional: MTP A/B, docs (`ROCMI4.md` / SUPPORT), commit.
 
+## W4A4-MMVQ (decode)
+
+Status: implemented and validated on RX 7900 XTX / gfx1100 (ROCm 10).
+
+Decode stays on MMVQ. Exact MMVQ unpacks weight nibbles and DP4As against Q8
+activations (`V_DOT4_I32_IU8`). W4A4-MMVQ instead:
+
+1. Quantizes MMVQ activations onto the signed IU4 grid (`amax/7`, clamp `[-8,7]`)
+   packed in the GGUF Q4_0 nibble layout (`lo = elem j`, `hi = elem j+16`).
+2. Dots packed weight dwords against packed activation dwords with
+   `V_DOT8_I32_IU4` (`ggml_cuda_dot8_iu4`).
+3. Scales with the true integer sum: `d_weight * d_act * sumi` (no WMMA `*16`).
+
+Gating matches MMQ: compile-time `GGML_HIP_ROCMI4_W4A4`, runtime
+`amd_wmma_iu4_available`. Exact MMVQ remains the default non-W4A4 build.
+
+Host oracle: `tests/test-rocmi4-iu4-dot.cpp` (packed IU4×IU4 DOT8 == unpack+DP4A
+against Q8-stored IU4, bit-identical integer sums).
+
+gfx1100 A/B (`llama-bench`, ngl 999, fa 1, r 2):
+
+| build | pp512 t/s | tg128 t/s |
+|---|---:|---:|
+| exact MMVQ (unpack + DOT4 vs Q8) | 1018.28 ± 136.80 | 42.26 ± 0.10 |
+| W4A4-MMQ + W4A4-MMVQ (DOT8) | 1277.66 ± 213.32 | 42.42 ± 0.15 |
+
+Prefill stays the W4A4 MMQ win (~+25%). Decode is still HBM-bandwidth bound:
+DOT8 removes the unpack+two-DP4A compute from MMVQ but does not move tg.
+Correctness on this gfx1100 run: host oracle `test-rocmi4-iu4-dot` OK;
+`test-backend-ops` MUL_MAT `q4_0_rocmi4` 12/12 (including `n=1` MMVQ) and
+MUL_MAT_ID 1/1 under `ROCMI4_W4A4` NMSE `1e-2`. HIP 7.15 has no
+`__builtin_amdgcn_sudot8`; `mmvq.cu.o` gfx1100 code object contains
+`v_dot8_i32_i4` (LLVM mnemonic for `V_DOT8_I32_IU4`) from inline asm
+`v_dot8_i32_iu4 ... neg_lo:[1,1,0]` (both operands signed). RDNA3.0 ROCMI4
+MMVQ stays at `nwarps=1`.
