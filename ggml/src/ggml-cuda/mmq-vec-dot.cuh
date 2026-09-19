@@ -1279,6 +1279,19 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmi4_w4a4_wmma(
             load_ldmatrix_16(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + kp, sram_stride);
         }
 
+        // Weight block scales do not depend on j0: read them once per k-step
+        // and share across both j-blocks. The WMMA accumulator unit *16 folds
+        // into dA, exact in fp32 (power-of-two scale of an fp32 value).
+        float dA16[ntx][tile_C::ne];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                dA16[n][l] = 16.0f * x_df[i*sram_stride + k0/QI8_0];
+            }
+        }
+
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
             tile_B B;
@@ -1294,10 +1307,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmi4_w4a4_wmma(
                 mma_iu4<true>(C, A[n], B);
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    const float dA = x_df[i*sram_stride + k0/QI8_0];
-                    const int acc = C.x[l]*16;
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += acc*dA*dB;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float(C.x[l]) * dA16[n][l]) * dB;
                 }
             }
         }
