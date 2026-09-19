@@ -857,6 +857,103 @@ backend of the kind that already exists for the MMVQ GLU fusion. Estimated
 ceiling +2-3% pp. `concat_non_cont` (96 x 85 us per pp512 pass) may be
 removable at the graph level - investigate, do not force it. Gate: Tier 2.
 
+## Revision 2 profiling pass (2026-09-19, rocprofv3)
+
+Purpose: replace trace-derived shares (shown unreliable by P-6a) with a
+reconciliation of three evidence classes, and ground the remaining levers in
+wall time. All runs on the committed P-2 build, `GGML_HIP_FORCE_MMQ=ON`,
+gfx1100, ROCm 10 container, rocprofv3 1.3.5.
+
+### What is and is not trustworthy on this stack
+
+Reliable:
+- Unprofiled `llama-bench` wall time (the arbiter for everything).
+- Dispatch counts per kernel from `--kernel-trace` (they match layer
+  arithmetic exactly).
+- Isolated, event-timed op benchmarks (`test-backend-ops perf`, probes).
+
+Not reliable, with evidence:
+- Per-kernel durations under the profiler, in both directions. In-context GDN
+  traced at 0.63 us/token while the isolated rate is 1.03 (post-P-6a attempt)
+  and 1.23 (baseline); the pp-trace MMQ busy-time sum implies ~115 TMAC/s
+  where MAC arithmetic and the doc's own sustained rate say 42-46; a decode
+  trace captured 16 of 128 tokens before the profiler stopped recording.
+- Any ROI argument built on traced durations or trace-derived shares. Both
+  P-6a and the original 8.6% GDN share came from that method and both were
+  wrong.
+
+Therefore: attribution = traced COUNTS x ISOLATED rates, reconciled against
+unprofiled wall. Durations under the profiler are used only as order-of-
+magnitude sanity checks.
+
+### Output-token caps (deliberate)
+
+- Prefill traces run with `-n 0`: prompt cost does not depend on generated
+  tokens; generating any would add a second workload to the trace.
+- Decode trace ran with `-n 128` at depth 0, not more: decode cost is
+  depth-dependent, not token-count-dependent, so generating more changes the
+  quantity being measured (every token would see a longer context) while
+  inflating the trace roughly 1850 dispatches per token. 128 samples pin the
+  mean token time to a couple of percent.
+- Depth-dependent decode was already measured separately with `-d` (TG-3).
+
+### Measured: ubatch sweep is the largest remaining pp lever, and it is a config
+
+| -ub | pp2048 t/s (unprofiled, -r 3) |
+|---:|---:|
+| 256 (serve script today) | 1416.94 +/- 0.69 |
+| 512 (llama-bench default) | 1533.41 +/- 0.80 |
+| 1024 | **1562.20 +/- 1.02** |
+| 2048 | 1561.15 +/- 64.53 (unstable) |
+
+Mechanism: at ub=256 each MMQ launch covers 2 j-tiles (128 blocks per launch
+against 96 CUs); at ub=1024 it covers 8 j-tiles (~5x the blocks), so the GPU
+is filled. ub=2048 matches the mean but with 60x the variance - same
+signature as the pp256 instability in TG-4, single-giant-chunk runs.
+Recommendation: serve with `-b 2048 -ub 1024`. Worth **+10.2% pp2048 for
+prompt processing against today's serve config**, zero code. Decode is
+unaffected (n=1 steps do not care about ub).
+
+### Decode dispatch budget per token (counts are exact, from trace)
+
+With FORCE_MMQ (bench env): ~496 MMQ + ~496 quantize_mmq + 448 eltwise +
+305 norms + 112 copy + 96 get-rows + 48 GDN + 32 rope + 16 FA ~ 2050
+dispatches per token. Serving (no FORCE_MMQ) swaps the 496+496 MMQ/quantize
+pair for ~436 MMVQ + ~436 quantize_q8_1, ~1450 total. At the measured 23.6 ms
+token wall, the launch floor alone (~2.7 us each) is 4-6 ms/token: dispatch
+reduction (TG-2 class) is bounded near +15% tg before byte trade-offs, and
+P-4's refutation already removes the biggest single candidate.
+
+### Prefill kernel budget at ub=1024 (count x isolated-rate, wall-anchored)
+
+Shares of the 1311 ms pass, using isolated rates where they exist:
+- MMQ: ~74% of kernel time (MAC arithmetic at the realized 42-46 TMAC/s).
+  Isolated kernel efficiency is 90.6 TFLOPS at the n=512 perf shape; the
+  whole-kernel mechanism list is exhausted (P-2 landed, P-8 refuted).
+- GDN: 96 launches x ~1.01 ms ~ 97 ms ~ 7.4% by isolated rates, yet an -18%
+  kernel change was invisible end to end (P-6a). Treat the true wall share
+  as unresolved in the 2-7% band until a chunked-kernel A/B exists.
+- FA: 32 launches x ~1.0 ms ~ 2.4% at ub=1024 (it is 8.6% at ub=256 - large
+  ubatch dissolves most of it).
+- quantize + eltwise + norms + copy + rope + get-rows: ~9% combined; P-7
+  (shared act-quant buffers) ceilings near +2%.
+
+### Ranked remaining levers, with their empirical bounds
+
+1. Serve config `-b 2048 -ub 1024`: +10.2% pp2048, measured, free. Do this
+   first.
+2. MMQ shape tuning at n>=1024: the perf suite stops at n=512 (90.6 TFLOPS);
+   whether the kernel holds that efficiency at n=1024/2048 is unmeasured
+   because the suite cannot express it. A one-off op benchmark at real
+   shapes would either close the question or expose a tuning target. Cheap.
+3. TG-2-class dispatch reduction for decode: bound ~+15% tg before byte
+   trade-offs; P-4 (the best single piece) is refuted; the rest is invasive
+   graph plumbing. Size any piece by wall-time prototype first.
+4. Chunked GDN (P-6): payoff unknown (projection withdrawn); helps long
+   chunks most; requires the full WY kernel and a graphs-off wall A/B.
+5. Tensor-core FA via rocWMMA: dependency not present in the container;
+   ceiling ~2-3% at ub=1024 anyway. Lowest priority.
+
 ## Correctness plan
 
 Every WP above runs behind these gates. Gates are declared before the work, not
