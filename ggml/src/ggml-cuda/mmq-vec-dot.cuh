@@ -1274,13 +1274,16 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmi4_w4a4_wmma(
         tile_A A[ntx];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + kp, sram_stride);
+            // 16-byte operand load: ROCmI4 sram_stride is 44 and kp is a multiple
+            // of 4, so the base is always 16 B aligned here.
+            load_ldmatrix_16(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + kp, sram_stride);
         }
 
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
             tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01/2, MMQ_TILE_Y_K);
+            // MMQ_TILE_Y_K is 36, also a multiple of 4.
+            load_ldmatrix_16(B, y_qs + j0*MMQ_TILE_Y_K + k01/2, MMQ_TILE_Y_K);
 
             const int j = j0 + tile_C::get_j(0);
             const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
