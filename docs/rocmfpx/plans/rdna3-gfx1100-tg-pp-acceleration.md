@@ -807,12 +807,45 @@ than it saves - keep fused tiles small and re-measure dispatches per token
 alongside tg (Tier 2 for pure reorderings, Tier 3 with pre-declared tolerance
 for accumulation-order changes).
 
-### P-6 - Chunked GDN prefill (unchanged from PP-3: 1-2 weeks, +8% pp)
+### P-6a - GDN token-loop operand prefetch - EXECUTED 2026-09-19, NEUTRAL END-TO-END, REVERTED
 
-The PP-3 assessment stands: a real kernel project (WY/triangular-solve
-structure, fluent-but-wrong failure mode). Its prefill share grows now that
-P-2 landed. Keep the PP-3 acceptance in full, including the Tier 3 (not
-Tier 2) gate and the rollback switch. Not started in this revision.
+Before attempting full chunking, the existing serial token loop was rewritten
+with double-buffered operand registers (k/q/g/v/beta of token t+1 load while
+token t computes). All loads are independent of the state chain, values and
+arithmetic order are unchanged, gates green (GATED_DELTA_NET OK, Tier 2
+token-exact).
+
+Two lessons, one per attempt:
+
+1. First version indexed the register buffers with the runtime `t & 1`. The
+   compiler demoted them to scratch memory (VGPR collapsed 224 -> 56 class,
+   here to 56) and the kernel ran 3.4x slower (631 -> 2126 us). A register
+   array indexed by a runtime value is not a register array. Rewritten with a
+   compile-time buffer tag and the token loop peeled into pairs; static
+   indexing restored.
+2. The fixed kernel wins the isolated op decisively: 631.35 -> 518.25 us at
+   n_seq_tokens=512 (-18%), and flash-attention aside, GDN measured 649.6 us
+   per 256-token launch in the real pipeline. But `pp2048` did not move:
+   1538.52 +/- 1.20 against 1537.27 +/- 0.40. The GDN durations seen in
+   rocprofv3 traces are inflated (the trap noted below), and the kernel's true
+   wall-time share of `pp2048` is too small for an 18% kernel win to clear
+   the noise floor. By the judge-on-pp2048 rule this is a no-gain change to a
+   core kernel, and it was reverted. The reverted build re-measured 1537.42
+   +/- 1.27.
+
+### P-6 - Chunked GDN prefill (sizing corrected: expected value much lower than +8%)
+
+The original +8% pp sizing came from the same trace method P-6a just
+discredited: 33 ms of traced GDN time per pp512 pass. In-model, GDN shows
+649.6 us per 256-token launch under the profiler, but an isolated -18%
+kernel improvement (which includes most of what chunking could win at
+256-token granularity) produced **zero** end-to-end movement. The chunked
+reformulation remains the only way to cut the serial-scan cost itself, and
+would still help long-prompt prefill where GDN launches stretch to 2048+
+tokens, but its projected value must be treated as unknown until a trace
+method that survives the profiler's inflation exists (e.g. comparing wall
+time with `GGML_CUDA_DISABLE_GDN_CHUNKED`-style A/B on a real build). The
+1-2 week project estimate stands; the payoff estimate does not.
 
 ### P-7 - Prefill elementwise cleanup (open, measured anchor)
 
@@ -903,6 +936,12 @@ plan.
   +3% end to end, because operand loads are a much smaller share of the real
   kernel than of a four-line probe loop. Use probes to decide *direction* and
   to rule things out; never to size a delivery.
+- **A register array indexed by a runtime value is scratch memory.** P-6a's
+  first version selected one of two operand buffers with `t & 1`; the compiler
+  moved the arrays to local memory (VGPR count collapsed) and the kernel ran
+  3.4x slower. Index register arrays only with compile-time constants (a
+  template tag plus loop peeling works), and check the VGPR count of any
+  change that adds indexed storage.
 - **An ablation bucket measured on an N-workgroup kernel is not recoverable by
   a change that costs residency.** P-1c put 190 us on staging+barriers, but
   that bucket was partly hidden by a second co-resident workgroup (30.2 KB LDS
@@ -1010,8 +1049,13 @@ Revision 2 final state (all short items executed 2026-09-19):
 5. ~~**P-4** quantize-into-MMVQ fusion~~ - refuted by byte arithmetic before
    implementation.
 6. **P-7** prefill cleanup - open, +2-3% pp ceiling, measured anchor.
-7. **P-5** GDN elementwise fusion - open, +3-6% tg, invasive.
-8. **P-6** chunked GDN - open, +8% pp, its own focused project.
+7. **P-5** GDN elementwise fusion - open, sized +3-6% tg from trace counts;
+   that method is now suspect (see P-6a), size it from wall time before
+   building.
+8. ~~**P-6** chunked GDN~~ - attempted the cheap half (P-6a, operand
+   prefetch): kernel -18% isolated, end-to-end neutral, reverted. The full
+   chunked reformulation's +8% pp projection is withdrawn; re-size from wall
+   time before starting it.
 
 ### Revision 2 outcome
 
@@ -1024,10 +1068,15 @@ Revision 2 final state (all short items executed 2026-09-19):
 | P-4 quantize fusion | refuted by arithmetic; dispatch cost < re-read bytes |
 | decode | unchanged from Revision 1: 42 t/s is within ~10% of the format+GPU floor |
 
-Where this leaves the model on this GPU: **pp2048 1537 t/s (+7.4% over the
-branch baseline), tg128 42.0-42.5 t/s.** The remaining prefill levers are
-P-6 (+8%, a project), P-7 (+2-3%) and P-5 (+3-6% tg); the remaining decode
-floor is the DRAM read of 13.62 GB per token, which is untouchable without
+Where this leaves the model on this GPU: **pp2048 1537 t/s (+7.3% over the
+branch baseline), tg128 42.1-42.4 t/s.** Both are within a few percent of
+what this format and GPU permit without speculative decoding: prefill is
+MMQ-issue-bound at ~90 TFLOPS on the perf shape with memory at 5% of peak,
+decode streams weights at 94% of the layout-limited ceiling. The remaining
+candidates (P-7, P-5) are single-digit-percent plumbings whose sizing methods
+P-6a just discredited - each must first show a wall-time win in a quick
+prototype before being built out. Nothing measured in Revision 2 changes the
+decode floor: 13.62 GB of weight reads per token is untouchable without
 speculative decoding (excluded) or a different format (excluded).
 
 Decode keeps its Revision 1 conclusion: 42.5 t/s is within ~10% of what this
