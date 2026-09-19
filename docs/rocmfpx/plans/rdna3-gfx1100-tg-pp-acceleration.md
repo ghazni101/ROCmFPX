@@ -1182,6 +1182,68 @@ decoding. The work above targets ~45-48 t/s; the 67.8 t/s DRAM floor needs
 fewer bytes per token, which without speculative decoding means changing the
 GGUF - a non-goal.
 
+## Magpie kernel evaluation and rocprofiler-compute status (2026-09-19)
+
+The P-2 epilogue restructure was additionally evaluated with AMD's Magpie
+framework (AMD-AGI/Magpie, run inside the ROCm 10 container). Magpie's
+compatibility matrix does not list gfx1100 (MI300X-class plus a bounded
+gfx1151 row only), so this run is itself the verification: the
+correctness/compare path works on gfx1100.
+
+Harness (`ggml/rocmfpx/magpie-eval/`): two kernel entries (baseline =
+commit 15acbdbbf tree, optimized = HEAD), each compiling the real W4A4
+vec-dot and tile loader from its tree into a standalone eval kernel that
+replicates the J=128 process-tile loop, plus a correctness testcase.
+Gate: outputs must be bit-exact against the merged-baseline golden
+checksum (the restructure's claimed property). Data uses constant nibbles
+per (row, block) so the fp64 reference is slot-order independent; the
+nibble k-order itself is covered by the repo's IU4 oracle and
+test-backend-ops.
+
+Results:
+
+- Correctness: 2/2 passed in `magpie compare`; both variants produce the
+  identical golden checksum (bit-exact equivalence confirmed by an
+  independent framework).
+- Kernel perf (harness event timing): baseline 43.40-43.76 us vs
+  optimized 39.87-40.28 us per tile-iteration, about -8 percent,
+  consistent with the test-backend-ops measurement (728 -> 670 us) and
+  the +7.2 percent pp2048 end-to-end result.
+- rocprofiler-compute (omniperf 3.3.0 from source, with a shim for
+  Magpie) was installed and committed as image `rocm-dev:10.0.0-rpc`.
+  Magpie's HIP performance ranking still fails on this GPU: omniperf
+  aborts with "Cannot find a supported arch in rocminfo: None" - gfx1100
+  is outside its supported-arch table. Kernel-comparison perf therefore
+  remains event-timed by the harness. Roofline ranking for kernel work on
+  gfx1100 needs an omniperf release that adds the arch, or manual
+  rocprofv3 counter queries.
+
+### Close-out of the remaining Revision 2 items
+
+- MMQ shape tuning at n >= 1024: RESOLVED as a config, not a kernel
+  change. The ub sweep measured it end to end (ub=1024 gives +3.2 percent
+  pp2048 over ub=512 and +10.2 percent over the old serve config).
+  Per-tile work is identical at larger ub; the gain is grid fill (2 -> 8
+  j-tiles per launch against 96 CUs). No separate kernel-tuning target
+  hides behind n >= 1024.
+- TG-2 dispatch reduction: bounded at +15 percent tg before byte
+  trade-offs; its largest single piece (P-4) is refuted, the rest needs
+  graph plumbing and a wall-time prototype before building.
+- P-7 shared act-quant: designed, not built. Safe cache key is the src1
+  tensor pointer (live graph nodes never overlap memory; distinct nodes
+  are distinct tensors), reset per graph evaluation; q/k/v collapse 3
+  quantizes to 1 and gate/up 2 to 1. Expected +1.5-2 percent pp from the
+  rocprofv3 dispatch counts (992 launches x 26.3 us per pp512 pass).
+  It touches pool ownership and graph capture, so it needs a session
+  with GPU access for the Tier 2 + pp2048 gates.
+- P-5 GDN elementwise fusion and P-6 chunked GDN: unchanged, sized from
+  wall time only.
+
+Skill note: of the local AMD skill collection, only magpie-kernel-evaluator
+applies to this work. serving-llms-on-instinct and serving-llms-on-epyc
+target vLLM on MI-series/EPYC; tracelens-analysis-orchestrator consumes
+torch profiler traces, which the llama.cpp stack does not produce.
+
 ## References
 
 - ISA: `rdna3-shader-instruction-set-architecture-feb-2023_0.md`, section 7.9
