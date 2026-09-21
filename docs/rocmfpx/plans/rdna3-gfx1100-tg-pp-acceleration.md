@@ -589,6 +589,35 @@ Do not reopen this without a new mechanism. MMVQ warp-count and vector-ratio
 tuning was already swept on this branch (nwarps 4 ties, 8 regresses, VDR 4 is
 numerically illegal); the tuning knobs were not merged.
 
+Revision 3 (2026-09-20, exclusive-GPU session; probe variants live in
+`ggml/rocmfpx/probes/layoutprobe.hip`): the table above mixes byte conventions.
+On true bytes touched (17 per block) the rates are: 16-byte misaligned loads
+890.8 GB/s, the real MMVQ shape (4 misaligned 4B loads + scale byte) 890.5
+GB/s, aligned cooperative loads staged through LDS with funnel-shift realign
+911.6 GB/s, aligned 16-byte control 918.4 GB/s. So the 17-byte layout costs
+about 3% on true bytes, not 9.3%, and a cooperative-realign kernel recovers
+only ~2.4% of streaming rate: NO-GO (LDS roundtrip, barriers, and P-8-style
+residency risk for ~1% end to end).
+
+The corrected denominator puts MMVQ at 792 GB/s = ~89% of what its own load
+shape sustains, not 94%. A second refutation closes that gap as structural:
+a manually double-buffered, prefetch-ahead k-loop (template tag, runtime env
+`GGML_CUDA_DISABLE_ROCMI4_MMVQ_PIPELINE`, bit-exact three-way greedy decode,
+Tier 1 clean in both states) measured **-3.3% tg128 at every depth**
+(44.47 -> 42.97 t/s at d0, noise floor 0.2%) and was reverted. Code-object
+metadata rules out the register-pressure theory: VGPR 15 vs 23, no spills,
+occupancy unaffected on either instantiation; the cost is the larger loop body
+itself (extra address math and guarded tail selects). With nwarps=4 already tying, the
+kernel is not thread- or latency-starved either; the residual ~11% versus the
+synthetic probe is the cost of 436 small tensors per token read as 2.7-9.2 KB
+rows by 32-thread blocks, versus one 4 GB sequential stream in the probe.
+
+Fresh HEAD baseline this session (tg128, -r 10): 44.36 +/- 0.20 (d0),
+43.60 +/- 0.16 (d8192), 40.23 +/- 0.14 (d32768). The serve-config lever
+(-b 2048 -ub 1024, the measured +10.2% pp2048) is now applied in
+`scripts/serve-qwen38-rocmi4-9001.sh`. TG kernel-body work stays closed;
+remaining decode upside is dispatch-side (P-5, WP5).
+
 ### TG-2 - Cut the 1414 small kernels per token (superseded by P-4 + P-5)
 
 At ~2.7 us of dispatch floor each, this stream costs ~3.8 ms/token of dispatch
@@ -953,6 +982,77 @@ Shares of the 1311 ms pass, using isolated rates where they exist:
    chunks most; requires the full WY kernel and a graphs-off wall A/B.
 5. Tensor-core FA via rocWMMA: dependency not present in the container;
    ceiling ~2-3% at ub=1024 anyway. Lowest priority.
+
+### Revision 4 (2026-09-20): post-WP4 decode census, WP5 closed, P-5 re-ranked
+
+Graphs-off `rocprofv3 --kernel-trace`, HEAD build, 128 tokens at d0; counts
+normalized by the exact MMVQ census (55,857 launches = 436/token). Post-WP4
+decode is ~1,240 launches/token (436 MMVQ + ~804 others, down from ~1,850
+pre-AR). Unprofiled d0 wall 22.54 ms (44.36 t/s). Attribution follows the
+Revision 2 rule: counts exact, traced durations inflated upper bounds
+(est-real = 2.35 us/launch dispatch floor + ~0.4x traced execution).
+
+| candidate | n/tok | traced ms/tok | % wall (bound) | est-real % |
+|---|---:|---:|---:|---:|
+| k_get_rows_float_vec (WP5) | 48.3 | 0.337 | 1.5% | ~1.1% |
+| rms_norm leftovers (1024 + 256) | 209.5 | 0.826 | 3.7% | ~3.6% |
+| copy/gather (cpy_scalar, get_rows_f32, set_rows, concat_cont) | 193.9 | 0.444 | 2.0% | ~2.8% |
+| elementwise (silu, sigmoid, bin_bcast) | 112.7 | 0.227 | 1.0% | ~1.6% |
+| quantize_q8_1 residual | 129.9 | 0.273 | 1.2% | ~1.8% |
+| ssm_conv | 48.3 | 0.141 | 0.6% | ~0.8% |
+| rope + flash_attn pair | 64.5 | 0.235 | 1.0% | ~1.1% |
+
+Verdicts:
+
+- **WP5 closed.** 1.5% upper bound < the 3% gate; an engine-level GDN
+  cache-read contract cannot pay for itself. Recorded in the AR plan.
+- **P-5 re-ranked.** Fusion order: (1) copy/gather family - mechanical,
+  plain GGML nodes, no engine contract; (2) elementwise epilogues - the WP3
+  pattern; (3) rms_norm leftovers - largest share but needs new epilogue
+  patterns (WP2 already took the producer-side ones). A batch covering (1)+(2)
+  removes ~306 launches/token for ~0.7-1.0 ms/token, **est. +3-4.5% tg at
+  d0**. The whole non-MMVQ launch stream floors at ~12.9% of wall - the
+  unreachable ceiling for TG-2-class work.
+
+### Revision 5 (2026-09-21): P-5 batch round 1 - F1 non-firing, F2a blocked, protocol trap found
+
+Round 1 implemented two dispatcher fusions from the Revision 4 re-rank:
+
+- **F1 mul_mat+reshape+add** (GDN residual ADD, 48 launches/token): implemented
+  in `ggml-cuda.cu` behind `GGML_CUDA_DISABLE_MUL_MAT_RESHAPE_ADD` (still in
+  the tree). Passes a CPU-builder graph replication, compiles clean, Tier 1
+  host asserts verified - but a rocprofv3 trace at the correct protocol
+  (`-n 128`, graphs off) shows it NEVER fires on the real decode graph:
+  `k_bin_bcast` stays 48.3/token and fused-MMVQ stays 241.7. The real backend
+  graph (buffer placement, COMPUTE/view flags, or can_fuse single-use rules)
+  rejects some predicate the replication satisfies. Next step: instrument the
+  matcher rejection reason on the live graph. Dead code until then; harmless
+  behind its switch.
+- **F2a conv-state chain fusion** (CONCAT+VIEW+CPY+SSM_CONV+silu+l2, 96
+  launches): was fully implemented (kernel `ssm_conv_state_f32`, matcher,
+  builder reorder in `qwen35.cpp` hoisting the ssm-state fetch) and compiled,
+  then reverted. The revert reason (allocator aliasing from the reorder) was
+  an artifact of a bad protocol - see below - so the refutation is VOID. The
+  code is no longer in the tree; re-implementation is cheap (matcher pins the
+  empirically verified node order CONCAT,VIEW,VIEW,CPY,SSM_CONV,SILU,L2s with
+  the ssm-state fetch hoisted before the conv chain; kernel reads old state +
+  qkv directly and writes the cache update view; layouts verified: old[c+3*ch]
+  for c<3, qkv[ch] for c=3, new[c+3*ch] = old[(c+1)+3*ch] for c<2 else qkv).
+  Re-test ONLY at -n 128.
+
+**Protocol trap (important for all future fusion work): decode fusion firing
+depends on `-n`.** At `-p 0 -n 32 -d 0` the UNMODIFIED HEAD binary does not
+fire WP4 (`ssm_conv_f32<...,false>` + 96.7 standalone `l2_norm_f32`/token);
+at `-n 128` it does (`<...,true>`, no l2 launches). Same binary, same flags
+otherwise. Mechanism unknown (suspect: graph rebuild/buffer-reuse thresholds
+crossed at different token positions). All AR-plan A/B numbers used -n 128
+throughout and are unaffected. Rule: any fusion census or trace must pin
+`-n 128` (or the production workload shape) and record graphs on/off.
+
+WP5 stays closed (Revision 4). The census-silence side quest: llama-bench
+installs a log callback that swallows the per-node `cuda_graph_census_exec`
+INFO lines after startup; census verification needs a different harness or
+log level - rocprofv3 kernel counts are the working substitute.
 
 ## Correctness plan
 
