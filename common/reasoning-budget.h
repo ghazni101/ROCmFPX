@@ -15,22 +15,23 @@ enum common_reasoning_budget_state {
     REASONING_BUDGET_DONE,         // passthrough forever
 };
 
-// Creates a reasoning budget sampler that limits token generation inside a
-// reasoning block (e.g. between <think> and </think>).
+// Creates a reasoning budget sampler that tracks a reasoning block
+// (e.g. between <think> and </think>).
 //
 // State machine: IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
 //   IDLE:         passthrough, watching for a start sequence
-//   COUNTING:     counting down remaining tokens, watching for a natural end sequence
+//   COUNTING:     optionally counting down remaining tokens; bans EOG so the
+//                 server cannot hard-stop mid-think; watches for a natural end
 //   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
 //   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
-//   DONE:         passthrough forever
+//   DONE:         passthrough forever (EOG allowed again)
 //
 // Parameters:
-//   vocab          - vocabulary (used for UTF-8 boundary detection; can be nullptr)
+//   vocab          - vocabulary (UTF-8 boundary + EOG ban; can be nullptr)
 //   start_seqs     - token sequences, any of which activates counting
 //   end_seqs       - token sequences, any of which naturally deactivates
 //   forced_tokens  - token sequence forced when budget expires
-//   budget         - max tokens allowed in the reasoning block
+//   budget         - max tokens in the reasoning block (INT_MAX = unlimited)
 //   initial_state  - initial state
 //
 struct llama_sampler * common_reasoning_budget_init(

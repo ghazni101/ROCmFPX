@@ -6,6 +6,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -115,17 +116,20 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                     COM_TRC("%s", "UTF-8 complete, now forcing end sequence\n");
                 }
             } else if (ctx->state == REASONING_BUDGET_COUNTING) {
-                ctx->remaining--;
-                if (ctx->remaining <= 0) {
-                    if (utf8_complete) {
-                        ctx->state = REASONING_BUDGET_FORCING;
-                        ctx->force_pos = 0;
-                        ctx->end_matcher.reset();
-                        COM_TRC("%s", "budget exhausted, forcing end sequence\n");
-                    } else {
-                        ctx->state = REASONING_BUDGET_WAITING_UTF8;
-                        ctx->end_matcher.reset();
-                        COM_TRC("%s", "budget exhausted, waiting for UTF-8 completion\n");
+                // INT_MAX means unlimited: never force-close the thinking block.
+                if (ctx->budget != INT_MAX) {
+                    ctx->remaining--;
+                    if (ctx->remaining <= 0) {
+                        if (utf8_complete) {
+                            ctx->state = REASONING_BUDGET_FORCING;
+                            ctx->force_pos = 0;
+                            ctx->end_matcher.reset();
+                            COM_TRC("%s", "budget exhausted, forcing end sequence\n");
+                        } else {
+                            ctx->state = REASONING_BUDGET_WAITING_UTF8;
+                            ctx->end_matcher.reset();
+                            COM_TRC("%s", "budget exhausted, waiting for UTF-8 completion\n");
+                        }
                     }
                 }
             }
@@ -166,8 +170,22 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
+    // While a thinking block is open, ban EOG tokens so the server cannot
+    // hard-stop mid-think (empty Chatty content) before </think> is emitted.
+    // Natural end tags (e.g. </think>) are not EOG and remain available.
+    if (ctx->state == REASONING_BUDGET_COUNTING || ctx->state == REASONING_BUDGET_WAITING_UTF8) {
+        if (ctx->vocab != nullptr) {
+            for (size_t i = 0; i < cur_p->size; i++) {
+                if (llama_vocab_is_eog(ctx->vocab, cur_p->data[i].id)) {
+                    cur_p->data[i].logit = -INFINITY;
+                }
+            }
+        }
+        return;
+    }
+
     if (ctx->state != REASONING_BUDGET_FORCING) {
-        // passthrough — don't modify logits
+        // IDLE / DONE — passthrough
         return;
     }
 
