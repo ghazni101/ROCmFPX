@@ -279,3 +279,36 @@ MUL_MAT_ID 1/1 under `ROCMI4_W4A4` NMSE `1e-2`. HIP 7.15 has no
 `v_dot8_i32_i4` (LLVM mnemonic for `V_DOT8_I32_IU4`) from inline asm
 `v_dot8_i32_iu4 ... neg_lo:[1,1,0]` (both operands signed). RDNA3.0 ROCMI4
 MMVQ stays at `nwarps=1`.
+
+## AR occupancy (no spec)
+
+Tried on gfx1100 W4A4, no MTP, `llama-bench -ngl 999 -fa 1` against
+Qwen3.8-27B Q4_0_ROCMI4. Sweep variables: MMVQ warp count at `ncols=1` and
+the Q8_1 MMVQ vector ratio.
+
+| config | pp512 t/s | tg128 t/s | notes |
+|---|---:|---:|---|
+| nwarps=1, VDR=2 (baseline) | 1277.66 ± 213.32 | 42.42 ± 0.15 | r=2; keep |
+| nwarps=8, VDR=2 | 1330.62 ± 172.82 | **40.18 ± 0.11** | r=3; AR regression |
+| nwarps=4, VDR=2 | 1329.75 ± 175.75 | 42.42 ± 0.11 | r=3; tg tie |
+| nwarps=1, VDR=4 | n/a | n/a | `n=1,k=4096` NMSE 0.0164 > 0.01; reject |
+
+Defaults stay `nwarps=1`, `VDR=2`. Extra warps do not raise non-spec decode;
+8 warps slow it. VDR=4 is not a legal ROCmI4 MMVQ ratio on this layout.
+Plain AR remains HBM-bound (~42 t/s). No speculative decoding in this sweep.
+
+## Next: measured gfx1100 pp/tg acceleration plan
+
+The occupancy sweep above is exhausted. The follow-on work, with measured
+hardware ceilings, a kernel-time decomposition, and PP/TG work packages, lives
+in [rdna3-gfx1100-tg-pp-acceleration.md](rdna3-gfx1100-tg-pp-acceleration.md).
+
+Its two load-bearing findings for this branch:
+
+- The IU8-vs-IU4 comparison (pp2048 1090.75 vs 1380.09 t/s, +26.5%) against a
+  2.0x IU4/IU8 MMA-issue ceiling ratio shows the W4A4 MMQ kernel spends ~74%
+  of its time on non-MMA work, not on IU4 WMMA issue. Prefill tuning belongs
+  in operand staging and the fp32 block-scale epilogue.
+- Decode is at 792 GB/s of the measured 923.5 GB/s streaming ceiling, so
+  `V_DOT8_I32_IU4` cannot move tg further. The remaining decode levers are
+  dispatch count and KV-cache bytes.
