@@ -303,6 +303,19 @@ Acceptance requires bit-exact states/outputs, complete GDN cache tests, and >=0.
 
 WP1 through WP4 remain enabled. Cumulative AR vs the frozen pre-change baseline already exceeds the 3% depth-0 gate (enabled means +5.64% / +5.14% / +4.73% / +4.38% at 0/2K/8K/32K). The WP2-era 8-token `rocprofv3` stats still list `k_get_rows_float_vec` at 1.50% of profiled kernel time (432 calls, 2.84 ms). That is still a real launch, but removing it needs an explicit GDN cache-read contract rather than another dispatcher fusion. WP5/WP6 are therefore left as follow-up: do not start them until a post-WP4 graphs-off trace still shows a kernel above 3% of token wall time, or a controlled gather ablation proves >=0.5% end-to-end AR.
 
+### WP5 gate verdict - 2026-09-20 post-WP4 trace
+
+Post-WP4 graphs-off `rocprofv3 --kernel-trace` decode census (HEAD binary,
+128 tokens, MMVQ count 55,857 = 436/token x 128.1 steps, self-consistent):
+`k_get_rows_float_vec` is 48.3 launches/token, 337 us/token traced = **1.5%
+of the 22.54 ms unprofiled d0 wall**. Traced durations are an inflated upper
+bound (Revision 2 rule); dispatch floor plus deflated execution puts it nearer
+1.1%. That is below the 3% trace gate, and the ablation alternative
+(>=0.5% end-to-end) cannot clear its own bar with an upper bound this small
+against an engine-level GDN cache-read contract. **WP5 stays closed.** The
+same census re-ranks the P-5 fusion batch; see Revision 4 of the master plan
+(`docs/rocmfpx/plans/rdna3-gfx1100-tg-pp-acceleration.md`).
+
 ## WP6 — Profile-gated kernel tuning, not fishing
 
 After fusion, reprofile. Tune a kernel only when it exceeds 3% of token wall time or a controlled ablation establishes an end-to-end ceiling.
