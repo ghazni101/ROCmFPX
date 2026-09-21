@@ -1019,8 +1019,8 @@ Verdicts:
 Round 1 implemented two dispatcher fusions from the Revision 4 re-rank:
 
 - **F1 mul_mat+reshape+add** (GDN residual ADD, 48 launches/token): implemented
-  in `ggml-cuda.cu` behind `GGML_CUDA_DISABLE_MUL_MAT_RESHAPE_ADD` (still in
-  the tree). Passes a CPU-builder graph replication, compiles clean, Tier 1
+  in `ggml-cuda.cu` behind `GGML_CUDA_DISABLE_MUL_MAT_RESHAPE_ADD` (kept on
+  the experiment branch, not merged). Passes a CPU-builder graph replication, compiles clean, Tier 1
   host asserts verified - but a rocprofv3 trace at the correct protocol
   (`-n 128`, graphs off) shows it NEVER fires on the real decode graph:
   `k_bin_bcast` stays 48.3/token and fused-MMVQ stays 241.7. The real backend
@@ -1290,7 +1290,7 @@ compatibility matrix does not list gfx1100 (MI300X-class plus a bounded
 gfx1151 row only), so this run is itself the verification: the
 correctness/compare path works on gfx1100.
 
-Harness (`ggml/rocmfpx/magpie-eval/`): two kernel entries (baseline =
+Magpie harness (kept on the experiment branch, not merged): two kernel entries (baseline =
 commit 15acbdbbf tree, optimized = HEAD), each compiling the real W4A4
 vec-dot and tile loader from its tree into a standalone eval kernel that
 replicates the J=128 process-tile loop, plus a correctness testcase.
