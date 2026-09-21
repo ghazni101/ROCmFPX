@@ -4553,6 +4553,74 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // mul_mat + reshape + add, for mm results reshaped to 2d before the bias add
+    // (GDN output projection: [ne00, ne11] -> [ne00, ne11*ne12])
+    static const bool disable_mul_mat_reshape_add = getenv("GGML_CUDA_DISABLE_MUL_MAT_RESHAPE_ADD") != nullptr;
+    if (!disable_mul_mat_reshape_add) {
+        for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+            const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+
+            if (!ggml_can_fuse(cgraph, i, { op, GGML_OP_RESHAPE, bias_op })) {
+                continue;
+            }
+
+            ggml_tensor * mm_node   = cgraph->nodes[i];
+            ggml_tensor * reshape   = cgraph->nodes[i + 1];
+            ggml_tensor * bias_node = cgraph->nodes[i + 2];
+
+            // the reshape must be a full contiguous view of the mm result
+            if (reshape->view_src != mm_node || reshape->view_offs != 0 ||
+                    ggml_nelements(reshape) != ggml_nelements(mm_node) || !ggml_is_contiguous(reshape)) {
+                continue;
+            }
+
+            ggml_tensor * bias_tensor = nullptr;
+            if (bias_op == GGML_OP_ADD) {
+                if (bias_node->src[0] == reshape) {
+                    bias_tensor = bias_node->src[1];
+                } else if (bias_node->src[1] == reshape) {
+                    bias_tensor = bias_node->src[0];
+                } else {
+                    continue;
+                }
+                if (!ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+                    continue;
+                }
+            } else {
+                if (bias_node->src[0] != reshape || bias_node->src[2] != mm_node->src[2]) {
+                    continue;
+                }
+                bias_tensor = bias_node->src[1];
+            }
+
+            const ggml_tensor * src0 = mm_node->src[0];
+            const ggml_tensor * src1 = mm_node->src[1];
+            const ggml_tensor * ids  = mm_node->src[2];
+
+            const int output_idx = i + 2;
+            if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &output_idx, 1)) {
+                continue;
+            }
+
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_bias = bias_tensor;
+
+            if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+        }
+    }
+
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
     }
