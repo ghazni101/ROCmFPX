@@ -35,5 +35,5 @@ exec docker run -d --name "$NAME" --restart unless-stopped \
     --host 0.0.0.0 --port 9001 \
     --alias "$ALIAS" \
     -dev ROCm0 -ngl 999 -np 1 \
-    -c 80000 -b 512 -ub 256 -t 16 -fa on \
+    -c 80000 -b 2048 -ub 1024 -t 16 -fa on \
     -ctk f16 -ctv f16 --jinja
